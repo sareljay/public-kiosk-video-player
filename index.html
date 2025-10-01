@@ -27,7 +27,6 @@
   <div class="wrap">
     <video id="player"
            autoplay
-           muted
            loop
            playsinline
            disablepictureinpicture
@@ -37,7 +36,7 @@
       <!-- Source is injected by JS from ?src=... -->
     </video>
   </div>
-  <div class="hint">Double‑click for fullscreen • Reloads on error • Loops forever</div>
+  <div class="hint">Click or Space to pause/play • Double‑click for fullscreen • Loops forever</div>
 
   <script>
     (function(){
@@ -45,8 +44,8 @@
       const src = qs.get('src');
       const type = qs.get('type') || '';
       const showControls = qs.get('controls') === '1';
-      const muted = qs.get('muted') !== '0'; // default true
-      const volume = parseFloat(qs.get('volume') || '0');
+      const muted = qs.get('muted') === '1'; // default false
+      const volume = parseFloat(qs.get('volume') || '1'); // default full volume
       const fit = qs.get('fit') || 'cover';
       const useCache = qs.get('cache') !== '0'; // default on
       const v = document.getElementById('player');
@@ -63,7 +62,7 @@
       v.style.objectFit = (fit === 'contain') ? 'contain' : 'cover';
       v.controls = showControls;
       v.muted = muted;
-      if (!muted) v.volume = Math.max(0, Math.min(1, isNaN(volume)? 1 : volume));
+      v.volume = Math.max(0, Math.min(1, isNaN(volume)? 1 : volume));
 
       // ---------- Simple offline-first caching ----------
       // We use the Cache Storage API (no service worker required) to persist the full video blob.
@@ -152,8 +151,14 @@
         source.src = src; if (type) source.type = type; v.appendChild(source);
       }
 
-      // Robust autoplay
-      const tryPlay = () => v.play().catch(() => { v.muted = true; v.play().catch(()=>{}); });
+      // Robust autoplay - try unmuted first, fallback to muted
+      const tryPlay = () => v.play().catch(() => {
+        v.muted = true;
+        v.play().catch(()=>{}).then(() => {
+          // Try to unmute after initial play succeeds
+          setTimeout(() => { v.muted = false; v.volume = volume; }, 100);
+        });
+      });
 
       // Keep alive behaviors
       v.addEventListener('ended', () => { v.currentTime = 0; tryPlay(); });
@@ -162,9 +167,32 @@
       document.addEventListener('visibilitychange', () => { if (!document.hidden) tryPlay(); });
       window.addEventListener('online', tryPlay);
 
+      // Click to pause/play
+      let lastClickTime = 0;
+      v.addEventListener('click', (e) => {
+        const now = Date.now();
+        // Ignore single clicks that are part of a double-click
+        if (now - lastClickTime < 300) return;
+        lastClickTime = now;
+        setTimeout(() => {
+          if (Date.now() - lastClickTime >= 300) {
+            // Single click confirmed - toggle play/pause
+            if (v.paused) v.play(); else v.pause();
+          }
+        }, 300);
+      });
+
       // Fullscreen
       v.addEventListener('dblclick', () => {
         if (!document.fullscreenElement) v.requestFullscreen?.(); else document.exitFullscreen?.();
+      });
+
+      // Spacebar to pause/play
+      document.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') {
+          e.preventDefault();
+          if (v.paused) v.play(); else v.pause();
+        }
       });
 
       // Prevent context menu/download prompts in kiosk
