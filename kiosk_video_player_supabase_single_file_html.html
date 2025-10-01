@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kiosk Video Player</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #000; }
+    .wrap { position: fixed; inset: 0; display: grid; place-items: center; background: #000; }
+    video { width: 100vw; height: 100vh; object-fit: cover; background: #000; }
+    .hint { position: fixed; right: .75rem; bottom: .5rem; color: #fff; font: 12px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; opacity: .4; }
+  </style>
+</head>
+<body>
+  <!--
+    How to use:
+    1) Upload your video to a *public* Supabase Storage bucket.
+    2) Open this file with a query param: ?src=PUBLIC_VIDEO_URL
+       Optional params:
+         - type=video/mp4 (or video/webm) — sets the MIME type
+         - controls=1 — show controls (default hidden)
+         - muted=0|1 — default 1 (autoplay policies require muted=1)
+         - volume=0..1 — sets volume (ignored if muted=1)
+         - fit=cover|contain — default cover
+    3) Double‑click toggles fullscreen. F11 also works in most kiosk browsers.
+  -->
+  <div class="wrap">
+    <video id="player"
+           autoplay
+           muted
+           loop
+           playsinline
+           disablepictureinpicture
+           controlslist="nodownload noplaybackrate"
+           preload="auto"
+           crossorigin="anonymous">
+      <!-- Source is injected by JS from ?src=... -->
+    </video>
+  </div>
+  <div class="hint">Double‑click for fullscreen • Reloads on error • Loops forever</div>
+
+  <script>
+    (function(){
+      const qs = new URLSearchParams(location.search);
+      const src = qs.get('src');
+      const type = qs.get('type') || '';
+      const showControls = qs.get('controls') === '1';
+      const muted = qs.get('muted') !== '0'; // default true
+      const volume = parseFloat(qs.get('volume') || '0');
+      const fit = qs.get('fit') || 'cover';
+      const useCache = qs.get('cache') !== '0'; // default on
+      const v = document.getElementById('player');
+
+      if (!src) {
+        document.body.style.background = '#111';
+        const msg = document.createElement('div');
+        msg.style.cssText = 'color:#bbb;position:absolute;inset:0;display:grid;place-items:center;font:16px system-ui;text-align:center;padding:20px;';
+        msg.innerHTML = 'Add <code>?src=PUBLIC_VIDEO_URL</code> to the URL.';
+        document.body.appendChild(msg);
+        return;
+      }
+
+      v.style.objectFit = (fit === 'contain') ? 'contain' : 'cover';
+      v.controls = showControls;
+      v.muted = muted;
+      if (!muted) v.volume = Math.max(0, Math.min(1, isNaN(volume)? 1 : volume));
+
+      // ---------- Simple offline-first caching ----------
+      // We use the Cache Storage API (no service worker required) to persist the full video blob.
+      // On page load we do a HEAD request to compare ETag/Last-Modified; if changed we re-download.
+      const CACHE_NAME = 'kiosk-video-cache-v1';
+      const etagKey = 'etag:' + src;
+      const lmKey = 'lm:' + src;
+
+      async function headMetadata(url){
+        try {
+          const res = await fetch(url, { method: 'HEAD', cache: 'no-store', mode: 'cors' });
+          if (!res.ok) throw new Error('HEAD ' + res.status);
+          return { etag: res.headers.get('ETag'), lm: res.headers.get('Last-Modified') };
+        } catch (e) {
+          // Some CDNs may block HEAD; fall back to GET metadata via a lightweight request (range 0-1MB)
+          try {
+            const res = await fetch(url, { headers: { 'Range':'bytes=0-1' }, cache: 'no-store', mode: 'cors' });
+            return { etag: res.headers.get('ETag'), lm: res.headers.get('Last-Modified') };
+          } catch(_) { return { etag: null, lm: null }; }
+        }
+      }
+
+      async function getCachedBlob(){
+        const cache = await caches.open(CACHE_NAME);
+        const match = await cache.match(src);
+        if (!match) return null;
+        try { return await match.blob(); } catch { return null; }
+      }
+
+      async function putCachedBlob(blob, headers={}){
+        const cache = await caches.open(CACHE_NAME);
+        const response = new Response(blob, { headers: { 'Content-Type': type || 'video/mp4', ...headers } });
+        await cache.put(src, response);
+      }
+
+      async function setVideoFromBlob(blob){
+        const url = URL.createObjectURL(blob);
+        v.src = url; // Directly set src to blob URL for jitter-free looping
+        // Clean up on unload
+        window.addEventListener('beforeunload', () => { URL.revokeObjectURL(url); });
+      }
+
+      async function downloadAndCache(){
+        const res = await fetch(src, { cache: 'no-store', mode: 'cors' });
+        if (!res.ok) throw new Error('GET ' + res.status);
+        const blob = await res.blob();
+        await putCachedBlob(blob, { 'X-Cached-At': new Date().toUTCString() });
+        await setVideoFromBlob(blob);
+        // Save validators for next boot
+        const et = res.headers.get('ETag');
+        const lm = res.headers.get('Last-Modified');
+        if (et) localStorage.setItem(etagKey, et); else localStorage.removeItem(etagKey);
+        if (lm) localStorage.setItem(lmKey, lm); else localStorage.removeItem(lmKey);
+      }
+
+      async function init(){
+        if (!useCache) {
+          // Fallback: normal streaming via network
+          const source = document.createElement('source');
+          source.src = src; if (type) source.type = type; v.appendChild(source);
+          tryPlay();
+          return;
+        }
+
+        // Try cached blob first for instant playback
+        const cached = await getCachedBlob();
+        if (cached) await setVideoFromBlob(cached);
+
+        // Check if remote changed; if no validators, we still revalidate via HEAD
+        const { etag, lm } = await headMetadata(src);
+        const prevEtag = localStorage.getItem(etagKey);
+        const prevLm = localStorage.getItem(lmKey);
+        const changed = (etag && prevEtag && etag !== prevEtag) || (lm && prevLm && lm !== prevLm);
+
+        if (!cached || changed || (!etag && !lm)) {
+          // Download fresh copy (and start playing the old one if present)
+          try { await downloadAndCache(); } catch(e){ if (!cached) fallbackStream(); }
+        }
+
+        tryPlay();
+      }
+
+      function fallbackStream(){
+        // As a last resort, stream from network
+        const source = document.createElement('source');
+        source.src = src; if (type) source.type = type; v.appendChild(source);
+      }
+
+      // Robust autoplay
+      const tryPlay = () => v.play().catch(() => { v.muted = true; v.play().catch(()=>{}); });
+
+      // Keep alive behaviors
+      v.addEventListener('ended', () => { v.currentTime = 0; tryPlay(); });
+      v.addEventListener('error', () => { setTimeout(()=>location.reload(), 1000); });
+      v.addEventListener('stalled', tryPlay);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) tryPlay(); });
+      window.addEventListener('online', tryPlay);
+
+      // Fullscreen
+      v.addEventListener('dblclick', () => {
+        if (!document.fullscreenElement) v.requestFullscreen?.(); else document.exitFullscreen?.();
+      });
+
+      // Prevent context menu/download prompts in kiosk
+      window.addEventListener('contextmenu', e => e.preventDefault());
+      document.addEventListener('keydown', e => {
+        if ((e.ctrlKey || e.metaKey) && ['s','p'].includes(e.key.toLowerCase())) e.preventDefault();
+      });
+
+      // Kick off
+      init();
+    })();
+  </script>
+</body>
+</html>
